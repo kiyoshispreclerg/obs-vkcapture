@@ -962,8 +962,33 @@ static bool gl_init(void *display, void *surface)
     return true;
 }
 
+static bool gl_capture_disabled()
+{
+    static int disabled = 0;
+
+    if (disabled != 0) {
+        return disabled == 1;
+    }
+
+    disabled = 1;
+
+    // Always use Vulkan capture with zink
+    const char *renderer = (const char *)gl_f.GetString(GL_RENDERER);
+    if (renderer && strncmp(renderer, "zink", 4) == 0) {
+        hlog("GL capture disabled with zink");
+        return true;
+    }
+
+    disabled = -1;
+    return false;
+}
+
 static void gl_capture(void *display, void *surface)
 {
+    if (gl_capture_disabled()) {
+        data.valid = false;
+        return;
+    }
     capture_update_socket();
 
     if (capture_should_stop()) {
