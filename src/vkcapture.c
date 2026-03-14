@@ -104,6 +104,7 @@ typedef struct {
     int buf_id;
     int client_id;
     struct capture_texture_data tdata;
+    bool was_showing;
 
 } vkcapture_source_t;
 
@@ -348,6 +349,7 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
     ctx->source = source;
 
     vkcapture_source_update(ctx, settings);
+    ctx->was_showing = true;
 
     cursor_create(ctx);
 
@@ -435,7 +437,25 @@ static void vkcapture_source_video_tick(void *data, float seconds)
 {
     vkcapture_source_t *ctx = data;
 
-    if (!obs_source_showing(ctx->source)) {
+    const bool is_showing = obs_source_showing(ctx->source);
+
+    if (is_showing != ctx->was_showing && ctx->client_id) {
+        pthread_mutex_lock(&server.mutex);
+        vkcapture_client_t *client = find_client_by_id(ctx->client_id);
+        if (client) {
+            activate_client(ctx, client, is_showing);
+
+            if (!is_showing) {
+                ctx->client_id = 0;
+                destroy_texture(ctx);
+            }
+        }
+        pthread_mutex_unlock(&server.mutex);
+
+        ctx->was_showing = is_showing;
+    }
+
+    if (!is_showing) {
         return;
     }
 
