@@ -38,6 +38,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "capture.h"
 #include "plugin-macros.h"
 
+#define MAX_WINDOW_LIST 16
+
 #if HAVE_X11_XCB
 #include "xcursor-xcb.h"
 static xcb_connection_t *xcb = NULL;
@@ -97,9 +99,8 @@ typedef struct {
     bool show_cursor;
     bool allow_transparency;
     bool force_hdr;
-    bool window_match;
-    bool window_exclude;
-    const char *window;
+    int window_mode;        // 0=any, 1=include list, 2=exclude list
+    DARRAY(char *) windows; // exe names
 
     int buf_id;
     int client_id;
@@ -316,6 +317,11 @@ static void vkcapture_source_destroy(void *data)
     destroy_texture(ctx);
     cursor_destroy(ctx);
 
+    for (size_t i = 0; i < ctx->windows.num; i++) {
+        bfree(ctx->windows.array[i]);
+    }
+    da_free(ctx->windows);
+
     bfree(ctx);
 }
 
@@ -327,17 +333,35 @@ static void vkcapture_source_update(void *data, obs_data_t *settings)
     ctx->allow_transparency = obs_data_get_bool(settings, "allow_transparency");
     ctx->force_hdr = obs_data_get_bool(settings, "force_hdr");
 
-    ctx->window_match = false;
-    ctx->window_exclude = false;
-    ctx->window = obs_data_get_string(settings, "window");
-    if (!strncmp(ctx->window, "exclude=", 8)) {
-        ctx->window_exclude = true;
-        ctx->window = ctx->window + 8;
-    } else {
-        ctx->window_match = true;
+    // Migrate old single-window setting to new format
+    const char *old_window = obs_data_get_string(settings, "window");
+    if (old_window && *old_window) {
+        if (!strncmp(old_window, "exclude=", 8) && *(old_window + 8)) {
+            obs_data_set_int(settings, "window_mode", 2);
+            obs_data_set_int(settings, "window_count", 1);
+            obs_data_set_string(settings, "window_0", old_window + 8);
+        } else if (strncmp(old_window, "exclude=", 8)) {
+            obs_data_set_int(settings, "window_mode", 1);
+            obs_data_set_int(settings, "window_count", 1);
+            obs_data_set_string(settings, "window_0", old_window);
+        }
+        obs_data_set_string(settings, "window", "");
     }
-    if (!strlen(ctx->window)) {
-        ctx->window = NULL;
+
+    for (size_t i = 0; i < ctx->windows.num; i++) {
+        bfree(ctx->windows.array[i]);
+    }
+    da_resize(ctx->windows, 0);
+
+    ctx->window_mode = (int)obs_data_get_int(settings, "window_mode");
+    for (int i = 0; i < MAX_WINDOW_LIST; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "window_%d", i);
+        const char *exe = obs_data_get_string(settings, key);
+        if (exe && *exe) {
+            char *copy = bstrdup(exe);
+            da_push_back(ctx->windows, &copy);
+        }
     }
 }
 
@@ -347,6 +371,7 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
 
     vkcapture_source_t *ctx = bzalloc(sizeof(vkcapture_source_t));
     ctx->source = source;
+    da_init(ctx->windows);
 
     vkcapture_source_update(ctx, settings);
     ctx->was_showing = true;
@@ -359,20 +384,26 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
 
 static vkcapture_client_t *find_matching_client(vkcapture_source_t *ctx)
 {
-    vkcapture_client_t *client = NULL;
-    if (ctx->window) {
-        for (size_t i = server.clients.num; i > 0; i--) {
-            vkcapture_client_t *c = server.clients.array + i - 1;
-            bool match = !strcmp(c->cdata.exe, ctx->window);
-            if ((ctx->window_match && match) || (ctx->window_exclude && !match)) {
-                client = c;
+    if (ctx->window_mode == 0 || ctx->windows.num == 0) {
+        return server.clients.num ? server.clients.array + server.clients.num - 1 : NULL;
+    }
+
+    for (size_t i = server.clients.num; i > 0; i--) {
+        vkcapture_client_t *c = server.clients.array + i - 1;
+
+        bool in_list = false;
+        for (size_t j = 0; j < ctx->windows.num; j++) {
+            if (!strcmp(c->cdata.exe, ctx->windows.array[j])) {
+                in_list = true;
                 break;
             }
         }
-    } else if (server.clients.num) {
-        client = server.clients.array + server.clients.num - 1;
+
+        if ((ctx->window_mode == 1 && in_list) || (ctx->window_mode == 2 && !in_list)) {
+            return c;
+        }
     }
-    return client;
+    return NULL;
 }
 
 static vkcapture_client_t *find_client_by_id(int id)
@@ -641,56 +672,166 @@ static void vkcapture_source_get_defaults(obs_data_t *defaults)
     obs_data_set_default_bool(defaults, "show_cursor", true);
     obs_data_set_default_bool(defaults, "allow_transparency", false);
     obs_data_set_default_bool(defaults, "force_hdr", false);
+    obs_data_set_default_int(defaults, "window_mode", 0);
+}
+
+static void populate_window_combo(obs_property_t *p)
+{
+    pthread_mutex_lock(&server.mutex);
+    for (size_t i = 0; i < server.clients.num; i++) {
+        vkcapture_client_t *client = server.clients.array + i;
+        bool already_listed = false;
+        for (size_t j = 0; j < obs_property_list_item_count(p); j++) {
+            if (!strcmp(client->cdata.exe, obs_property_list_item_string(p, j))) {
+                already_listed = true;
+                break;
+            }
+        }
+        if (!already_listed) {
+            obs_property_list_add_string(p, client->cdata.exe, client->cdata.exe);
+        }
+    }
+    pthread_mutex_unlock(&server.mutex);
+}
+
+static void update_window_list_visibility(obs_properties_t *props, obs_data_t *settings, int mode)
+{
+    int active = 0;
+    for (int i = 0; i < MAX_WINDOW_LIST; i++) {
+        char combo_key[32], btn_key[32];
+        snprintf(combo_key, sizeof(combo_key), "window_%d", i);
+        snprintf(btn_key, sizeof(btn_key), "remove_%d", i);
+        const char *val = obs_data_get_string(settings, combo_key);
+        bool has_value = val && *val;
+        if (has_value) active++;
+        bool visible = mode != 0 && has_value;
+        obs_property_t *combo = obs_properties_get(props, combo_key);
+        obs_property_t *btn = obs_properties_get(props, btn_key);
+        if (combo) obs_property_set_visible(combo, visible);
+        if (btn) obs_property_set_visible(btn, visible);
+    }
+    obs_property_t *add_btn = obs_properties_get(props, "add_window");
+    if (add_btn) obs_property_set_visible(add_btn, mode != 0 && active < MAX_WINDOW_LIST);
+}
+
+static bool window_mode_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+    int mode = (int)obs_data_get_int(settings, "window_mode");
+    update_window_list_visibility(props, settings, mode);
+    return true;
+}
+
+static bool add_window_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+    vkcapture_source_t *ctx = obs_properties_get_param(props);
+    if (!ctx) return false;
+
+    obs_data_t *settings = obs_source_get_settings(ctx->source);
+
+    // Find the first empty slot and show it
+    int active = 0;
+    int free_slot = -1;
+    for (int i = 0; i < MAX_WINDOW_LIST; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "window_%d", i);
+        const char *val = obs_data_get_string(settings, key);
+        if (val && *val) {
+            active++;
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+
+    if (free_slot >= 0) {
+        char combo_key[32], btn_key[32];
+        snprintf(combo_key, sizeof(combo_key), "window_%d", free_slot);
+        snprintf(btn_key, sizeof(btn_key), "remove_%d", free_slot);
+        obs_property_t *combo = obs_properties_get(props, combo_key);
+        obs_property_t *btn = obs_properties_get(props, btn_key);
+        if (combo) obs_property_set_visible(combo, true);
+        if (btn) obs_property_set_visible(btn, true);
+        active++;
+    }
+
+    obs_property_t *add_btn = obs_properties_get(props, "add_window");
+    if (add_btn) obs_property_set_visible(add_btn, active < MAX_WINDOW_LIST);
+
+    obs_data_release(settings);
+    return true;
+}
+
+static bool remove_window_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+    vkcapture_source_t *ctx = obs_properties_get_param(props);
+    if (!ctx) return false;
+
+    obs_data_t *settings = obs_source_get_settings(ctx->source);
+
+    const char *name = obs_property_name(p);
+    int idx = atoi(name + 7); // "remove_" = 7 chars
+
+    char combo_key[32], btn_key[32];
+    snprintf(combo_key, sizeof(combo_key), "window_%d", idx);
+    snprintf(btn_key, sizeof(btn_key), "remove_%d", idx);
+
+    obs_data_set_string(settings, combo_key, "");
+
+    obs_property_t *combo = obs_properties_get(props, combo_key);
+    obs_property_t *btn = obs_properties_get(props, btn_key);
+    if (combo) obs_property_set_visible(combo, false);
+    if (btn) obs_property_set_visible(btn, false);
+
+    // A slot just freed up, so the add button should be visible
+    obs_property_t *add_btn = obs_properties_get(props, "add_window");
+    if (add_btn) obs_property_set_visible(add_btn, true);
+
+    obs_data_release(settings);
+    return true;
 }
 
 static obs_properties_t *vkcapture_source_get_properties(void *data)
 {
     vkcapture_source_t *ctx = data;
 
+    obs_data_t *settings = ctx ? obs_source_get_settings(ctx->source) : NULL;
+    int mode = settings ? (int)obs_data_get_int(settings, "window_mode") : 0;
+
     obs_properties_t *props = obs_properties_create();
+    obs_properties_set_param(props, ctx, NULL);
 
-    obs_property_t *p = obs_properties_add_list(props, "window",
-            obs_module_text("CaptureWindow"),
-            OBS_COMBO_TYPE_LIST,
-            OBS_COMBO_FORMAT_STRING);
-    obs_property_list_add_string(p, obs_module_text("CaptureAnyWindow"), "");
+    obs_property_t *mode_prop = obs_properties_add_list(props, "window_mode",
+        obs_module_text("CaptureMode"),
+        OBS_COMBO_TYPE_LIST,
+        OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(mode_prop, obs_module_text("CaptureAnyWindow"), 0);
+    obs_property_list_add_int(mode_prop, obs_module_text("CaptureIncludeOnly"), 1);
+    obs_property_list_add_int(mode_prop, obs_module_text("CaptureExclude"), 2);
+    obs_property_set_modified_callback(mode_prop, window_mode_changed);
 
-    if (ctx) {
-        bool window_found = false;
-        pthread_mutex_lock(&server.mutex);
-        for (size_t i = 0; i < server.clients.num; i++) {
-            vkcapture_client_t *client = server.clients.array + i;
+    int active = 0;
+    for (int i = 0; i < MAX_WINDOW_LIST; i++) {
+        char combo_key[32], btn_key[32], combo_label[32];
+        snprintf(combo_key, sizeof(combo_key), "window_%d", i);
+        snprintf(btn_key, sizeof(btn_key), "remove_%d", i);
+        snprintf(combo_label, sizeof(combo_label), "Window %d", i + 1);
 
-            bool already_exists = false;
-            for (size_t j = 0; j < obs_property_list_item_count(p); j++) {
-                if (!strcmp(client->cdata.exe, obs_property_list_item_string(p, j))) {
-                    already_exists = true;
-                }
-            }
-            if (already_exists) {
-                continue;
-            }
+        const char *val = settings ? obs_data_get_string(settings, combo_key) : "";
+        bool has_value = val && *val;
+        if (has_value) active++;
 
-            obs_property_list_add_string(p, client->cdata.exe, client->cdata.exe);
-            if (ctx->window && !strcmp(client->cdata.exe, ctx->window)) {
-                window_found = true;
-            }
-        }
-        pthread_mutex_unlock(&server.mutex);
-        if (ctx->window && !window_found) {
-            obs_property_list_add_string(p, ctx->window, ctx->window);
-        }
+        obs_property_t *combo = obs_properties_add_list(props, combo_key, combo_label,
+            OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+        populate_window_combo(combo);
+        obs_property_set_visible(combo, mode != 0 && has_value);
+
+        obs_property_t *btn = obs_properties_add_button(props, btn_key,
+            obs_module_text("RemoveWindow"), remove_window_clicked);
+        obs_property_set_visible(btn, mode != 0 && has_value);
     }
 
-    size_t count = obs_property_list_item_count(p);
-    for (size_t i = 1; i < count; ++i) {
-        char name[128];
-        char value[128];
-        const char *item = obs_property_list_item_string(p, i);
-        snprintf(name, sizeof(name), "%s %s", obs_module_text("CaptureAnyWindowExcept"), item);
-        snprintf(value, sizeof(value), "exclude=%s", obs_property_list_item_string(p, i));
-        obs_property_list_add_string(p, name, value);
-    }
+    obs_property_t *add_btn = obs_properties_add_button(props, "add_window",
+        obs_module_text("AddWindow"), add_window_clicked);
+    obs_property_set_visible(add_btn, mode != 0 && active < MAX_WINDOW_LIST);
 
     if (!ctx || cursor_enabled(ctx)) {
         obs_properties_add_bool(props, "show_cursor", obs_module_text("CaptureCursor"));
@@ -699,6 +840,7 @@ static obs_properties_t *vkcapture_source_get_properties(void *data)
     obs_properties_add_bool(props, "allow_transparency", obs_module_text("AllowTransparency"));
     obs_properties_add_bool(props, "force_hdr", obs_module_text("ForceHDR"));
 
+    if (settings) obs_data_release(settings);
     return props;
 }
 
