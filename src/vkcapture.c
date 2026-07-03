@@ -389,6 +389,61 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
     return ctx;
 }
 
+// Returns the 1-based position of `client` among all connected clients that
+// share its executable name (in connection order), and stores the total number
+// of those clients in `count` when non-NULL. Must be called with server.mutex held.
+static int client_instance_index(const vkcapture_client_t *client, int *count)
+{
+    int idx = 0;
+    int total = 0;
+    for (size_t i = 0; i < server.clients.num; i++) {
+        const vkcapture_client_t *c = server.clients.array + i;
+        if (strcmp(c->cdata.exe, client->cdata.exe)) {
+            continue;
+        }
+        ++total;
+        if (c == client) {
+            idx = total;
+        }
+    }
+    if (count) {
+        *count = total;
+    }
+    return idx;
+}
+
+// Matches a client against a window selection string. The selection is either a
+// plain executable name (matches any capture of it) or "exe#N" to pin the Nth
+// capture of that executable (see client_instance_index), which lets a source
+// target one specific drawable when a program has several (e.g. one per
+// monitor). Must be called with server.mutex held.
+static bool client_matches_selection(const vkcapture_client_t *client, const char *sel)
+{
+    const char *hash = strrchr(sel, '#');
+    int want_idx = 0;
+    if (hash && hash[1]) {
+        const char *d = hash + 1;
+        while (*d >= '0' && *d <= '9') {
+            ++d;
+        }
+        if (*d == '\0') {
+            want_idx = atoi(hash + 1);
+        }
+    }
+    if (want_idx <= 0) {
+        hash = NULL;
+    }
+
+    const size_t base_len = hash ? (size_t)(hash - sel) : strlen(sel);
+    if (strncmp(client->cdata.exe, sel, base_len) || client->cdata.exe[base_len] != '\0') {
+        return false;
+    }
+    if (want_idx && client_instance_index(client, NULL) != want_idx) {
+        return false;
+    }
+    return true;
+}
+
 static vkcapture_client_t *find_matching_client(vkcapture_source_t *ctx)
 {
     if (ctx->window_mode == 0 || ctx->windows.num == 0) {
@@ -400,7 +455,7 @@ static vkcapture_client_t *find_matching_client(vkcapture_source_t *ctx)
 
         bool in_list = false;
         for (size_t j = 0; j < ctx->windows.num; j++) {
-            if (!strcmp(c->cdata.exe, ctx->windows.array[j])) {
+            if (client_matches_selection(c, ctx->windows.array[j])) {
                 in_list = true;
                 break;
             }
@@ -701,20 +756,33 @@ static void vkcapture_source_get_defaults(obs_data_t *defaults)
     obs_data_set_default_int(defaults, "window_mode", 0);
 }
 
+static void combo_add_unique(obs_property_t *p, const char *value)
+{
+    for (size_t j = 0; j < obs_property_list_item_count(p); j++) {
+        if (!strcmp(value, obs_property_list_item_string(p, j))) {
+            return;
+        }
+    }
+    obs_property_list_add_string(p, value, value);
+}
+
 static void populate_window_combo(obs_property_t *p)
 {
     pthread_mutex_lock(&server.mutex);
     for (size_t i = 0; i < server.clients.num; i++) {
         vkcapture_client_t *client = server.clients.array + i;
-        bool already_listed = false;
-        for (size_t j = 0; j < obs_property_list_item_count(p); j++) {
-            if (!strcmp(client->cdata.exe, obs_property_list_item_string(p, j))) {
-                already_listed = true;
-                break;
-            }
-        }
-        if (!already_listed) {
-            obs_property_list_add_string(p, client->cdata.exe, client->cdata.exe);
+
+        // Always offer the plain executable, which matches any of its captures.
+        combo_add_unique(p, client->cdata.exe);
+
+        // When the same executable has several captures (e.g. one drawable per
+        // monitor), also offer an "exe#N" entry to pin a specific one.
+        int count = 0;
+        const int idx = client_instance_index(client, &count);
+        if (count > 1) {
+            char value[64];
+            snprintf(value, sizeof(value), "%s#%d", client->cdata.exe, idx);
+            combo_add_unique(p, value);
         }
     }
     pthread_mutex_unlock(&server.mutex);

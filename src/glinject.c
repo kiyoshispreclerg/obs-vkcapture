@@ -42,7 +42,10 @@ static struct vk_funcs vk_f;
 
 static bool vkcapture_glvulkan = false;
 
-struct gl_data {
+// Per-drawable capture state. A single process (e.g. a compositor) may render
+// several drawables at once (one per monitor), so we keep one of these - and one
+// capture connection - per surface instead of a single global capture.
+struct gl_surface {
     void *display;
     void *surface;
     int width;
@@ -58,21 +61,66 @@ struct gl_data {
     int nfd;
     int buf_fds[4];
 
-    bool glx;
     unsigned long xpixmap;
     void *glxpixmap;
+
+    VkImage vkimage;
+    VkDeviceMemory vkmemory;
+
+    capture_t *capture;
+};
+
+// Process-wide state shared by every surface (GL backend and, for the
+// OBS_VKCAPTURE_GLVULKAN path, the single Vulkan device used for all surfaces).
+static struct {
+    bool glx;
+    bool valid;
 
     VkInstance vkinst;
     VkPhysicalDevice vkphys_dev;
     VkDevice vkdev;
-    VkImage vkimage;
-    VkDeviceMemory vkmemory;
-
     uint8_t device_uuid[16];
+} gl;
 
-    bool valid;
-};
-static struct gl_data data;
+#define MAX_GL_SURFACES 16
+static struct gl_surface *gl_surfaces[MAX_GL_SURFACES];
+
+static struct gl_surface *gl_surface_get(void *surface)
+{
+    for (int i = 0; i < MAX_GL_SURFACES; ++i) {
+        if (gl_surfaces[i] && gl_surfaces[i]->surface == surface) {
+            return gl_surfaces[i];
+        }
+    }
+    return NULL;
+}
+
+static struct gl_surface *gl_surface_get_or_create(void *surface)
+{
+    struct gl_surface *s = gl_surface_get(surface);
+    if (s) {
+        return s;
+    }
+    for (int i = 0; i < MAX_GL_SURFACES; ++i) {
+        if (!gl_surfaces[i]) {
+            s = calloc(1, sizeof(struct gl_surface));
+            if (!s) {
+                return NULL;
+            }
+            memset(s->buf_fds, -1, sizeof(s->buf_fds));
+            s->capture = capture_create();
+            if (!s->capture) {
+                free(s);
+                return NULL;
+            }
+            s->surface = surface;
+            gl_surfaces[i] = s;
+            return s;
+        }
+    }
+    hlog("Reached maximum number of capture surfaces (%d)", MAX_GL_SURFACES);
+    return NULL;
+}
 
 #define GETADDR(s, p, func) \
     p.func = (typeof(p.func))real_dlsym(RTLD_NEXT, #s #func); \
@@ -126,10 +174,8 @@ static bool gl_init_funcs(bool glx)
 
     vkcapture_glvulkan = getenv("OBS_VKCAPTURE_GLVULKAN");
 
-    capture_init();
-    memset(&data, 0, sizeof(struct gl_data));
-    memset(data.buf_fds, -1, sizeof(data.buf_fds));
-    data.glx = glx;
+    memset(&gl, 0, sizeof(gl));
+    gl.glx = glx;
 
     if (glx) {
         void *handle = dlopen("libGLX.so.0", RTLD_LAZY);
@@ -223,7 +269,7 @@ static bool gl_init_funcs(bool glx)
     GETGLPROCADDR(TexStorageMem2DEXT);
     GETGLPROCADDR(IsMemoryObjectEXT);
 
-    data.valid = true;
+    gl.valid = true;
 
     return true;
 }
@@ -262,7 +308,7 @@ static bool vulkan_init_funcs()
 #undef GETEGLPROCADDR
 
 #define GETVKPROC(p, d, func) \
-    vk_f.func = (typeof(vk_f.func))vk_f.p(data.d, "vk" #func); \
+    vk_f.func = (typeof(vk_f.func))vk_f.p(gl.d, "vk" #func); \
     if (!vk_f.func) { \
         hlog("Failed to resolve vk" #func); \
         goto fail; \
@@ -273,7 +319,7 @@ static bool vulkan_init_funcs()
 
 static bool vulkan_init()
 {
-    if (data.vkdev) {
+    if (gl.vkdev) {
         return true;
     }
 
@@ -281,7 +327,7 @@ static bool vulkan_init()
         return false;
     }
 
-    gl_f.GetUnsignedBytei_vEXT(0x9597, 0, data.device_uuid);
+    gl_f.GetUnsignedBytei_vEXT(0x9597, 0, gl.device_uuid);
 
     const char *instance_extensions[] = {
         VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
@@ -316,7 +362,7 @@ static bool vulkan_init()
     char *disable_vkcapture = getenv("DISABLE_OBS_VKCAPTURE");
     setenv("DISABLE_OBS_VKCAPTURE", "1", 1);
 
-    VkResult res = vk_f.CreateInstance(&instanceInfo, NULL, &data.vkinst);
+    VkResult res = vk_f.CreateInstance(&instanceInfo, NULL, &gl.vkinst);
 
     if (disable_vkcapture) {
         setenv("DISABLE_OBS_VKCAPTURE", disable_vkcapture, 1);
@@ -337,7 +383,7 @@ static bool vulkan_init()
 
     uint32_t deviceCount = 16;
     VkPhysicalDevice physicalDevices[16];
-    res = vk_f.EnumeratePhysicalDevices(data.vkinst, &deviceCount, physicalDevices);
+    res = vk_f.EnumeratePhysicalDevices(gl.vkinst, &deviceCount, physicalDevices);
     if (res != VK_SUCCESS) {
         hlog("Vulkan: Failed to enumerate physical devices %s", result_to_str(res));
         goto fail;
@@ -349,12 +395,12 @@ static bool vulkan_init()
         props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
         props.pNext = &propsID;
         vk_f.GetPhysicalDeviceProperties2(physicalDevices[i], &props);
-        if (memcmp(data.device_uuid, propsID.deviceUUID, sizeof(data.device_uuid)) == 0) {
-            data.vkphys_dev = physicalDevices[i];
+        if (memcmp(gl.device_uuid, propsID.deviceUUID, sizeof(gl.device_uuid)) == 0) {
+            gl.vkphys_dev = physicalDevices[i];
             break;
         }
     }
-    if (!data.vkphys_dev) {
+    if (!gl.vkphys_dev) {
         hlog("Vulkan: Failed to find matching device");
         goto fail;
     }
@@ -372,11 +418,11 @@ static bool vulkan_init()
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.enabledExtensionCount = sizeof(device_extensions) / sizeof(*device_extensions);
     deviceInfo.ppEnabledExtensionNames = device_extensions;
-    res = vk_f.CreateDevice(data.vkphys_dev, &deviceInfo, NULL, &data.vkdev);
+    res = vk_f.CreateDevice(gl.vkphys_dev, &deviceInfo, NULL, &gl.vkdev);
     if (res != VK_SUCCESS) {
         /* Try without VK_EXT_image_drm_format_modifier */
         deviceInfo.enabledExtensionCount--;
-        res = vk_f.CreateDevice(data.vkphys_dev, &deviceInfo, NULL, &data.vkdev);
+        res = vk_f.CreateDevice(gl.vkphys_dev, &deviceInfo, NULL, &gl.vkdev);
     }
     if (res != VK_SUCCESS) {
         hlog("Vulkan: Failed to create device %s", result_to_str(res));
@@ -393,7 +439,7 @@ static bool vulkan_init()
     GETDEVPROC(GetMemoryFdKHR);
 
     vk_f.GetImageDrmFormatModifierPropertiesEXT = (PFN_vkGetImageDrmFormatModifierPropertiesEXT)
-        vk_f.GetDeviceProcAddr(data.vkdev, "vkGetImageDrmFormatModifierPropertiesEXT");
+        vk_f.GetDeviceProcAddr(gl.vkdev, "vkGetImageDrmFormatModifierPropertiesEXT");
     if (!vk_f.GetImageDrmFormatModifierPropertiesEXT) {
         hlog("DRM format modifier support not available");
     }
@@ -401,13 +447,13 @@ static bool vulkan_init()
     return true;
 
 fail:
-    if (data.vkdev) {
-        vk_f.DestroyDevice(data.vkdev, NULL);
-        data.vkdev = VK_NULL_HANDLE;
+    if (gl.vkdev) {
+        vk_f.DestroyDevice(gl.vkdev, NULL);
+        gl.vkdev = VK_NULL_HANDLE;
     }
-    if (data.vkinst) {
-        vk_f.DestroyInstance(data.vkinst, NULL);
-        data.vkinst = VK_NULL_HANDLE;
+    if (gl.vkinst) {
+        vk_f.DestroyInstance(gl.vkinst, NULL);
+        gl.vkinst = VK_NULL_HANDLE;
     }
     return false;
 }
@@ -416,24 +462,24 @@ fail:
 #undef GETINSTPROC
 #undef GETDEVPROC
 
-static bool vulkan_shtex_init()
+static bool vulkan_shtex_init(struct gl_surface *s)
 {
     if (!vulkan_init()) {
         return false;
     }
 
-    gl_f.GenFramebuffers(1, &data.fbo);
-    if (data.fbo == 0) {
+    gl_f.GenFramebuffers(1, &s->fbo);
+    if (s->fbo == 0) {
         hlog("Failed to initialize FBO");
         return false;
     }
 
-    const bool no_modifiers = capture_allocate_no_modifiers();
-    const bool linear = capture_allocate_linear();
-    const bool map_host = capture_allocate_map_host();
-    const bool same_device = capture_compare_device_uuid(data.device_uuid);
+    const bool no_modifiers = capture_ctx_allocate_no_modifiers(s->capture);
+    const bool linear = capture_ctx_allocate_linear(s->capture);
+    const bool map_host = capture_ctx_allocate_map_host(s->capture);
+    const bool same_device = capture_ctx_compare_device_uuid(s->capture, gl.device_uuid);
 
-    hlog("Texture %s %ux%u", "GL_RGBA (Vulkan)", data.width, data.height);
+    hlog("Texture %s %ux%u", "GL_RGBA (Vulkan)", s->width, s->height);
 
     VkExternalMemoryImageCreateInfo ext_mem_image_info = {};
     ext_mem_image_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
@@ -449,8 +495,8 @@ static bool vulkan_shtex_init()
     img_info.samples = VK_SAMPLE_COUNT_1_BIT;
     img_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    img_info.extent.width = data.width;
-    img_info.extent.height = data.height;
+    img_info.extent.width = s->width;
+    img_info.extent.height = s->height;
     img_info.extent.depth = 1;
     img_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     img_info.tiling = VK_IMAGE_TILING_LINEAR;
@@ -469,12 +515,12 @@ static bool vulkan_shtex_init()
         format_props.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
         format_props.pNext = &modifier_props_list;
 
-        vk_f.GetPhysicalDeviceFormatProperties2KHR(data.vkphys_dev, img_info.format, &format_props);
+        vk_f.GetPhysicalDeviceFormatProperties2KHR(gl.vkphys_dev, img_info.format, &format_props);
 
         modifier_props = malloc(modifier_props_list.drmFormatModifierCount * sizeof(struct VkDrmFormatModifierPropertiesEXT));
         modifier_props_list.pDrmFormatModifierProperties = modifier_props;
 
-        vk_f.GetPhysicalDeviceFormatProperties2KHR(data.vkphys_dev, img_info.format, &format_props);
+        vk_f.GetPhysicalDeviceFormatProperties2KHR(gl.vkphys_dev, img_info.format, &format_props);
 
 #ifndef NDEBUG
         hlog("Available modifiers:");
@@ -500,7 +546,7 @@ static bool vulkan_shtex_init()
             VkImageFormatProperties2KHR format_props = {};
             format_props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
 
-            VkResult result = vk_f.GetPhysicalDeviceImageFormatProperties2KHR(data.vkphys_dev, &format_info, &format_props);
+            VkResult result = vk_f.GetPhysicalDeviceImageFormatProperties2KHR(gl.vkphys_dev, &format_info, &format_props);
             if (result == VK_SUCCESS) {
 #ifndef NDEBUG
                 hlog(" %d: modifier:%"PRIu64" planes:%d", i,
@@ -527,7 +573,7 @@ static bool vulkan_shtex_init()
         }
     }
 
-    VkResult res = vk_f.CreateImage(data.vkdev, &img_info, NULL, &data.vkimage);
+    VkResult res = vk_f.CreateImage(gl.vkdev, &img_info, NULL, &s->vkimage);
     free(image_modifiers);
     if (res != VK_SUCCESS) {
         hlog("Vulkan: Failed to create image %s", result_to_str(res));
@@ -535,7 +581,7 @@ static bool vulkan_shtex_init()
     }
 
     VkImageMemoryRequirementsInfo2 memri = {};
-    memri.image = data.vkimage;
+    memri.image = s->vkimage;
     memri.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
 
     VkMemoryDedicatedRequirements mdr = {};
@@ -545,13 +591,13 @@ static bool vulkan_shtex_init()
     memr.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
     memr.pNext = &mdr;
 
-    vk_f.GetImageMemoryRequirements2KHR(data.vkdev, &memri, &memr);
+    vk_f.GetImageMemoryRequirements2KHR(gl.vkdev, &memri, &memr);
 
     /* -------------------------------------------------------- */
     /* get memory type index                                    */
 
     VkPhysicalDeviceMemoryProperties pdmp;
-    vk_f.GetPhysicalDeviceMemoryProperties(data.vkphys_dev, &pdmp);
+    vk_f.GetPhysicalDeviceMemoryProperties(gl.vkphys_dev, &pdmp);
 
     VkExportMemoryAllocateInfo memory_export_info = {};
     memory_export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
@@ -560,7 +606,7 @@ static bool vulkan_shtex_init()
     VkMemoryDedicatedAllocateInfo memory_dedicated_info = {};
     memory_dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     memory_dedicated_info.pNext = &memory_export_info;
-    memory_dedicated_info.image = data.vkimage;
+    memory_dedicated_info.image = s->vkimage;
 
     VkMemoryAllocateInfo memi = {};
     memi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -577,7 +623,7 @@ static bool vulkan_shtex_init()
                 (pdmp.memoryTypes[i].propertyFlags &
                  mem_req_bits) == mem_req_bits) {
             memi.memoryTypeIndex = i;
-            res = vk_f.AllocateMemory(data.vkdev, &memi, NULL, &data.vkmemory);
+            res = vk_f.AllocateMemory(gl.vkdev, &memi, NULL, &s->vkmemory);
             allocated = res == VK_SUCCESS;
             if (allocated)
                 break;
@@ -591,7 +637,7 @@ static bool vulkan_shtex_init()
                     (pdmp.memoryTypes[i].propertyFlags &
                      mem_req_bits) != mem_req_bits) {
                 memi.memoryTypeIndex = i;
-                res = vk_f.AllocateMemory(data.vkdev, &memi, NULL, &data.vkmemory);
+                res = vk_f.AllocateMemory(gl.vkdev, &memi, NULL, &s->vkmemory);
                 allocated = res == VK_SUCCESS;
                 if (allocated)
                     break;
@@ -607,10 +653,10 @@ static bool vulkan_shtex_init()
 
     VkBindImageMemoryInfo bimi = {};
     bimi.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
-    bimi.image = data.vkimage;
-    bimi.memory = data.vkmemory;
+    bimi.image = s->vkimage;
+    bimi.memory = s->vkmemory;
     bimi.memoryOffset = 0;
-    res = vk_f.BindImageMemory2KHR(data.vkdev, 1, &bimi);
+    res = vk_f.BindImageMemory2KHR(gl.vkdev, 1, &bimi);
     if (res != VK_SUCCESS) {
         hlog("Vulkan: BindImageMemory2KHR failed %s", result_to_str(res));
         return false;
@@ -618,10 +664,10 @@ static bool vulkan_shtex_init()
 
     VkMemoryGetFdInfoKHR memFdInfo = {};
     memFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    memFdInfo.memory = data.vkmemory;
+    memFdInfo.memory = s->vkmemory;
     memFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
     int fd = -1;
-    res = vk_f.GetMemoryFdKHR(data.vkdev, &memFdInfo, &fd);
+    res = vk_f.GetMemoryFdKHR(gl.vkdev, &memFdInfo, &fd);
     if (res != VK_SUCCESS) {
         hlog("Vulkan: GetMemoryFdKHR opaque_fd failed %s", result_to_str(res));
         return false;
@@ -636,10 +682,10 @@ static bool vulkan_shtex_init()
     gl_f.MemoryObjectParameterivEXT(glmem, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
     gl_f.ImportMemoryFdEXT(glmem, memi.allocationSize, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
 
-    gl_f.GenTextures(1, &data.texture);
-    gl_f.BindTexture(GL_TEXTURE_2D, data.texture);
+    gl_f.GenTextures(1, &s->texture);
+    gl_f.BindTexture(GL_TEXTURE_2D, s->texture);
     gl_f.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT, img_info.tiling == VK_IMAGE_TILING_LINEAR || linear ? GL_LINEAR_TILING_EXT : GL_OPTIMAL_TILING_EXT);
-    gl_f.TexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, data.width, data.height, glmem, 0);
+    gl_f.TexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, s->width, s->height, glmem, 0);
     gl_f.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     gl_f.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
@@ -650,7 +696,7 @@ static bool vulkan_shtex_init()
 
     memFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     int dmabuf_fd = -1;
-    res = vk_f.GetMemoryFdKHR(data.vkdev, &memFdInfo, &dmabuf_fd);
+    res = vk_f.GetMemoryFdKHR(gl.vkdev, &memFdInfo, &dmabuf_fd);
     if (res != VK_SUCCESS) {
         hlog("Vulkan: GetMemoryFdKHR dma_buf failed %s", result_to_str(res));
         return false;
@@ -659,14 +705,14 @@ static bool vulkan_shtex_init()
     if (!no_modifiers && vk_f.GetImageDrmFormatModifierPropertiesEXT) {
         VkImageDrmFormatModifierPropertiesEXT image_mod_props = {};
         image_mod_props.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
-        res = vk_f.GetImageDrmFormatModifierPropertiesEXT(data.vkdev, data.vkimage, &image_mod_props);
+        res = vk_f.GetImageDrmFormatModifierPropertiesEXT(gl.vkdev, s->vkimage, &image_mod_props);
         if (VK_SUCCESS != res) {
             hlog("GetImageDrmFormatModifierPropertiesEXT failed %s", result_to_str(res));
-            data.buf_modifier = DRM_FORMAT_MOD_INVALID;
+            s->buf_modifier = DRM_FORMAT_MOD_INVALID;
         } else {
-            data.buf_modifier = image_mod_props.drmFormatModifier;
+            s->buf_modifier = image_mod_props.drmFormatModifier;
             for (uint32_t i = 0; i < modifier_prop_count; ++i) {
-                if (modifier_props[i].drmFormatModifier == data.buf_modifier) {
+                if (modifier_props[i].drmFormatModifier == s->buf_modifier) {
                     num_planes = modifier_props[i].drmFormatModifierPlaneCount;
                     break;
                 }
@@ -674,7 +720,7 @@ static bool vulkan_shtex_init()
         }
         free(modifier_props);
     } else {
-        data.buf_modifier = DRM_FORMAT_MOD_INVALID;
+        s->buf_modifier = DRM_FORMAT_MOD_INVALID;
     }
 
     for (int i = 0; i < num_planes; i++) {
@@ -687,106 +733,106 @@ static bool vulkan_shtex_init()
         sbr.mipLevel = 0;
         sbr.arrayLayer = 0;
         VkSubresourceLayout layout;
-        vk_f.GetImageSubresourceLayout(data.vkdev, data.vkimage, &sbr, &layout);
+        vk_f.GetImageSubresourceLayout(gl.vkdev, s->vkimage, &sbr, &layout);
 
-        data.buf_fds[i] = i == 0 ? dmabuf_fd : os_dupfd_cloexec(dmabuf_fd);
-        data.buf_strides[i] = layout.rowPitch;
-        data.buf_offsets[i] = layout.offset;
+        s->buf_fds[i] = i == 0 ? dmabuf_fd : os_dupfd_cloexec(dmabuf_fd);
+        s->buf_strides[i] = layout.rowPitch;
+        s->buf_offsets[i] = layout.offset;
     }
-    data.nfd = num_planes;
-    data.buf_fourcc = DRM_FORMAT_ABGR8888;
+    s->nfd = num_planes;
+    s->buf_fourcc = DRM_FORMAT_ABGR8888;
 
 #ifndef NDEBUG
-    hlog("Got planes %d fd %d", data.nfd, data.buf_fds[0]);
-    if (data.buf_modifier != DRM_FORMAT_MOD_INVALID) {
-        hlog("Got modifier %"PRIu64, data.buf_modifier);
+    hlog("Got planes %d fd %d", s->nfd, s->buf_fds[0]);
+    if (s->buf_modifier != DRM_FORMAT_MOD_INVALID) {
+        hlog("Got modifier %"PRIu64, s->buf_modifier);
     }
 #endif
 
     return true;
 }
 
-static void querySurface(int *width, int *height)
+static void querySurface(struct gl_surface *s, int *width, int *height)
 {
-    if (data.glx) {
+    if (gl.glx) {
         unsigned w, h;
-        glx_f.QueryDrawable(data.display, data.surface, P_GLX_WIDTH, &w);
-        glx_f.QueryDrawable(data.display, data.surface, P_GLX_HEIGHT, &h);
+        glx_f.QueryDrawable(s->display, s->surface, P_GLX_WIDTH, &w);
+        glx_f.QueryDrawable(s->display, s->surface, P_GLX_HEIGHT, &h);
         *width = w;
         *height = h;
     } else {
-        egl_f.QuerySurface(data.display, data.surface, P_EGL_WIDTH, width);
-        egl_f.QuerySurface(data.display, data.surface, P_EGL_HEIGHT, height);
+        egl_f.QuerySurface(s->display, s->surface, P_EGL_WIDTH, width);
+        egl_f.QuerySurface(s->display, s->surface, P_EGL_HEIGHT, height);
     }
 }
 
-static void gl_free()
+static void gl_free(struct gl_surface *s)
 {
-    const bool was_capturing = data.nfd;
+    const bool was_capturing = s->nfd;
 
-    if (data.nfd) {
-        for (int i = 0; i < data.nfd; ++i) {
-            close(data.buf_fds[i]);
-            data.buf_fds[i] = -1;
+    if (s->nfd) {
+        for (int i = 0; i < s->nfd; ++i) {
+            close(s->buf_fds[i]);
+            s->buf_fds[i] = -1;
         }
-        data.nfd = 0;
+        s->nfd = 0;
     }
 
-    if (data.image) {
-        egl_f.DestroyImage(data.display, data.image);
-        data.image = NULL;
+    if (s->image) {
+        egl_f.DestroyImage(s->display, s->image);
+        s->image = NULL;
     }
 
-    if (data.xpixmap) {
-        x11_f.XFreePixmap(data.display, data.xpixmap);
-        data.xpixmap = 0;
+    if (s->xpixmap) {
+        x11_f.XFreePixmap(s->display, s->xpixmap);
+        s->xpixmap = 0;
     }
 
-    if (data.glxpixmap) {
-        glx_f.DestroyPixmap(data.display, data.glxpixmap);
-        data.glxpixmap = NULL;
+    if (s->glxpixmap) {
+        glx_f.DestroyPixmap(s->display, s->glxpixmap);
+        s->glxpixmap = NULL;
     }
 
-    if (data.fbo) {
-        gl_f.DeleteFramebuffers(1, &data.fbo);
-        data.fbo = 0;
+    if (s->fbo) {
+        gl_f.DeleteFramebuffers(1, &s->fbo);
+        s->fbo = 0;
     }
 
-    if (data.texture) {
-        gl_f.DeleteTextures(1, &data.texture);
-        data.texture = 0;
+    if (s->texture) {
+        gl_f.DeleteTextures(1, &s->texture);
+        s->texture = 0;
     }
 
-    if (data.vkimage) {
-        vk_f.DestroyImage(data.vkdev, data.vkimage, NULL);
-        data.vkimage = VK_NULL_HANDLE;
+    if (s->vkimage) {
+        vk_f.DestroyImage(gl.vkdev, s->vkimage, NULL);
+        s->vkimage = VK_NULL_HANDLE;
     }
 
-    if (data.vkmemory) {
-        vk_f.FreeMemory(data.vkdev, data.vkmemory, NULL);
-        data.vkmemory = VK_NULL_HANDLE;
+    if (s->vkmemory) {
+        vk_f.FreeMemory(gl.vkdev, s->vkmemory, NULL);
+        s->vkmemory = VK_NULL_HANDLE;
     }
 
-    capture_stop();
+    capture_ctx_stop(s->capture);
 
     if (was_capturing) {
         hlog("------------------- opengl capture freed -------------------");
     }
 }
 
-static void gl_copy_backbuffer(GLuint dst)
+static void gl_copy_backbuffer(struct gl_surface *s, GLuint dst)
 {
     gl_f.Disable(GL_FRAMEBUFFER_SRGB);
     gl_f.BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    gl_f.BindFramebuffer(GL_DRAW_FRAMEBUFFER, data.fbo);
+    gl_f.BindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
     gl_f.BindTexture(GL_TEXTURE_2D, dst);
     gl_f.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst, 0);
     gl_f.ReadBuffer(GL_BACK);
     gl_f.DrawBuffer(GL_COLOR_ATTACHMENT0);
-    gl_f.BlitFramebuffer(0, 0, data.width, data.height, 0, 0, data.width, data.height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    gl_f.BlitFramebuffer(0, 0, s->width, s->height, 0, 0, s->width, s->height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
 }
 
-static void gl_shtex_capture()
+static void gl_shtex_capture(struct gl_surface *s)
 {
     GLboolean last_srgb;
     GLint last_read_fbo;
@@ -798,7 +844,7 @@ static void gl_shtex_capture()
     gl_f.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &last_draw_fbo);
     gl_f.GetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
 
-    gl_copy_backbuffer(data.texture);
+    gl_copy_backbuffer(s, s->texture);
 
     gl_f.BindTexture(GL_TEXTURE_2D, last_tex);
     gl_f.BindFramebuffer(GL_DRAW_FRAMEBUFFER, last_draw_fbo);
@@ -810,13 +856,13 @@ static void gl_shtex_capture()
     }
 }
 
-static bool gl_shtex_init()
+static bool gl_shtex_init(struct gl_surface *s)
 {
     if (vkcapture_glvulkan) {
         return false;
     }
 
-    if (data.glx) {
+    if (gl.glx) {
         // GLX on NVIDIA is all kinds of broken...
         const char *vendor = (const char*)gl_f.GetString(GL_VENDOR);
         if (strcmp(vendor, "NVIDIA Corporation") == 0) {
@@ -824,23 +870,23 @@ static bool gl_shtex_init()
         }
     }
 
-    gl_f.GenFramebuffers(1, &data.fbo);
-    if (data.fbo == 0) {
+    gl_f.GenFramebuffers(1, &s->fbo);
+    if (s->fbo == 0) {
         hlog("Failed to initialize FBO");
         return false;
     }
 
-    hlog("Texture %s %ux%u", "GL_RGBA", data.width, data.height);
+    hlog("Texture %s %ux%u", "GL_RGBA", s->width, s->height);
 
-    gl_f.GenTextures(1, &data.texture);
-    gl_f.BindTexture(GL_TEXTURE_2D, data.texture);
-    gl_f.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, data.width, data.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    gl_f.GenTextures(1, &s->texture);
+    gl_f.BindTexture(GL_TEXTURE_2D, s->texture);
+    gl_f.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s->width, s->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     gl_f.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     gl_f.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    if (data.glx) {
-        unsigned long root = P_DefaultRootWindow(data.display);
-        data.xpixmap = x11_f.XCreatePixmap(data.display, root, data.width, data.height, 24);
+    if (gl.glx) {
+        unsigned long root = P_DefaultRootWindow(s->display);
+        s->xpixmap = x11_f.XCreatePixmap(s->display, root, s->width, s->height, 24);
 
         const int pixmap_config[] = {
             P_GLX_BIND_TO_TEXTURE_RGBA_EXT, true,
@@ -854,7 +900,7 @@ static bool gl_shtex_init()
             0
         };
         int nelements;
-        void **fbc = glx_f.ChooseFBConfig(data.display, P_DefaultScreen(data.display), pixmap_config, &nelements);
+        void **fbc = glx_f.ChooseFBConfig(s->display, P_DefaultScreen(s->display), pixmap_config, &nelements);
         if (nelements <= 0) {
             hlog("Failed to choose FBConfig");
             goto fail;
@@ -866,39 +912,39 @@ static bool gl_shtex_init()
             P_GLX_MIPMAP_TEXTURE_EXT, false,
             0
         };
-        data.glxpixmap = glx_f.CreatePixmap(data.display, fbc[0], data.xpixmap, pixmapAttribs);
+        s->glxpixmap = glx_f.CreatePixmap(s->display, fbc[0], s->xpixmap, pixmapAttribs);
         x11_f.XFree(fbc);
 
-        glx_f.BindTexImageEXT(data.display, data.glxpixmap, P_GLX_FRONT_LEFT_EXT, NULL);
+        glx_f.BindTexImageEXT(s->display, s->glxpixmap, P_GLX_FRONT_LEFT_EXT, NULL);
 
-        void *xcb_con = x11_f.XGetXCBConnection(data.display);
-        P_xcb_dri3_buffers_from_pixmap_cookie_t cookie = x11_f.xcb_dri3_buffers_from_pixmap(xcb_con, data.xpixmap);
+        void *xcb_con = x11_f.XGetXCBConnection(s->display);
+        P_xcb_dri3_buffers_from_pixmap_cookie_t cookie = x11_f.xcb_dri3_buffers_from_pixmap(xcb_con, s->xpixmap);
         P_xcb_dri3_buffers_from_pixmap_reply_t *reply = x11_f.xcb_dri3_buffers_from_pixmap_reply(xcb_con, cookie, NULL);
         if (!reply) {
             hlog("Failed to get buffer from pixmap");
             goto fail;
         }
-        data.nfd = reply->nfd;
+        s->nfd = reply->nfd;
         for (uint8_t i = 0; i < reply->nfd; ++i) {
-            data.buf_fds[i] = x11_f.xcb_dri3_buffers_from_pixmap_reply_fds(xcb_con, reply)[i];
-            data.buf_strides[i] = x11_f.xcb_dri3_buffers_from_pixmap_strides(reply)[i];
-            data.buf_offsets[i] = x11_f.xcb_dri3_buffers_from_pixmap_offsets(reply)[i];
+            s->buf_fds[i] = x11_f.xcb_dri3_buffers_from_pixmap_reply_fds(xcb_con, reply)[i];
+            s->buf_strides[i] = x11_f.xcb_dri3_buffers_from_pixmap_strides(reply)[i];
+            s->buf_offsets[i] = x11_f.xcb_dri3_buffers_from_pixmap_offsets(reply)[i];
         }
-        data.buf_fourcc = DRM_FORMAT_ARGB8888;
-        data.buf_modifier = reply->modifier;
+        s->buf_fourcc = DRM_FORMAT_ARGB8888;
+        s->buf_modifier = reply->modifier;
         free(reply);
     } else {
-        data.image = egl_f.CreateImage(data.display, egl_f.GetCurrentContext(), P_EGL_GL_TEXTURE_2D, data.texture, NULL);
-        if (!data.image) {
+        s->image = egl_f.CreateImage(s->display, egl_f.GetCurrentContext(), P_EGL_GL_TEXTURE_2D, s->texture, NULL);
+        if (!s->image) {
             hlog("Failed to create EGL image");
             goto fail;
         }
-        const int queried = egl_f.ExportDMABUFImageQueryMESA(data.display, data.image, &data.buf_fourcc, &data.nfd, &data.buf_modifier);
+        const int queried = egl_f.ExportDMABUFImageQueryMESA(s->display, s->image, &s->buf_fourcc, &s->nfd, &s->buf_modifier);
         if (!queried) {
             hlog("Failed to query dmabuf export");
             goto fail;
         }
-        const int exported = egl_f.ExportDMABUFImageMESA(data.display, data.image, data.buf_fds, data.buf_strides, data.buf_offsets);
+        const int exported = egl_f.ExportDMABUFImageMESA(s->display, s->image, s->buf_fds, s->buf_strides, s->buf_offsets);
         if (!exported) {
             hlog("Failed dmabuf export");
             goto fail;
@@ -908,42 +954,42 @@ static bool gl_shtex_init()
     return true;
 
 fail:
-    data.nfd = 0;
-    if (data.fbo) {
-        gl_f.DeleteFramebuffers(1, &data.fbo);
-        data.fbo = 0;
+    s->nfd = 0;
+    if (s->fbo) {
+        gl_f.DeleteFramebuffers(1, &s->fbo);
+        s->fbo = 0;
     }
-    if (data.xpixmap) {
-        x11_f.XFreePixmap(data.display, data.xpixmap);
-        data.xpixmap = 0;
+    if (s->xpixmap) {
+        x11_f.XFreePixmap(s->display, s->xpixmap);
+        s->xpixmap = 0;
     }
-    if (data.glxpixmap) {
-        glx_f.DestroyPixmap(data.display, data.glxpixmap);
-        data.glxpixmap = NULL;
+    if (s->glxpixmap) {
+        glx_f.DestroyPixmap(s->display, s->glxpixmap);
+        s->glxpixmap = NULL;
     }
-    if (data.image) {
-        egl_f.DestroyImage(data.display, data.image);
-        data.image = NULL;
+    if (s->image) {
+        egl_f.DestroyImage(s->display, s->image);
+        s->image = NULL;
     }
     return false;
 }
 
-static bool gl_init(void *display, void *surface)
+static bool gl_init(struct gl_surface *s, void *display, void *surface)
 {
-    data.display = display;
-    data.surface = surface;
-    querySurface(&data.width, &data.height);
+    s->display = display;
+    s->surface = surface;
+    querySurface(s, &s->width, &s->height);
 
-    if (data.glx) {
-        data.winid = (uintptr_t)surface;
+    if (gl.glx) {
+        s->winid = (uintptr_t)surface;
     }
 
     GLint last_tex;
     gl_f.GetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
 
-    bool init = gl_shtex_init();
+    bool init = gl_shtex_init(s);
     if (!init) {
-        init = vulkan_shtex_init();
+        init = vulkan_shtex_init(s);
     }
 
     gl_f.BindTexture(GL_TEXTURE_2D, last_tex);
@@ -953,9 +999,9 @@ static bool gl_init(void *display, void *surface)
         return false;
     }
 
-    capture_init_shtex(data.width, data.height, data.buf_fourcc,
-            data.buf_strides, data.buf_offsets, data.buf_modifier,
-            data.winid, /*flip*/true, 0, data.nfd, data.buf_fds);
+    capture_ctx_init_shtex(s->capture, s->width, s->height, s->buf_fourcc,
+            s->buf_strides, s->buf_offsets, s->buf_modifier,
+            s->winid, /*flip*/true, 0, s->nfd, s->buf_fds);
 
     hlog("------------------ opengl capture started ------------------");
 
@@ -986,33 +1032,51 @@ static bool gl_capture_disabled()
 static void gl_capture(void *display, void *surface)
 {
     if (gl_capture_disabled()) {
-        data.valid = false;
+        gl.valid = false;
         return;
     }
-    capture_update_socket();
 
-    if (capture_should_stop()) {
-        gl_free();
+    struct gl_surface *s = gl_surface_get_or_create(surface);
+    if (!s) {
+        return;
+    }
+    s->display = display;
+
+    capture_ctx_update_socket(s->capture);
+
+    if (capture_ctx_should_stop(s->capture)) {
+        gl_free(s);
     }
 
-    if (capture_should_init()) {
-        if (!gl_init(display, surface)) {
-            gl_free();
-            data.valid = false;
+    if (capture_ctx_should_init(s->capture)) {
+        if (!gl_init(s, display, surface)) {
+            gl_free(s);
             hlog("gl_init failed");
         }
     }
 
-    if (capture_ready() && data.surface == surface) {
+    if (capture_ctx_ready(s->capture)) {
         int width, height;
-        querySurface(&width, &height);
-        if (data.height != height || data.width != width) {
+        querySurface(s, &width, &height);
+        if (s->height != height || s->width != width) {
             if (width != 0 && height != 0) {
-                gl_free();
+                gl_free(s);
             }
             return;
         }
-        gl_shtex_capture();
+        gl_shtex_capture(s);
+    }
+}
+
+static void gl_surface_destroy_all(void)
+{
+    for (int i = 0; i < MAX_GL_SURFACES; ++i) {
+        if (gl_surfaces[i]) {
+            gl_free(gl_surfaces[i]);
+            capture_destroy(gl_surfaces[i]->capture);
+            free(gl_surfaces[i]);
+            gl_surfaces[i] = NULL;
+        }
     }
 }
 
@@ -1060,7 +1124,7 @@ unsigned eglDestroyContext(void *display, void *context)
         return 0;
     }
 
-    gl_free();
+    gl_surface_destroy_all();
 
     return egl_f.DestroyContext(display, context);
 }
@@ -1071,7 +1135,7 @@ unsigned eglSwapBuffers(void *display, void *surface)
         return 0;
     }
 
-    if (data.valid) {
+    if (gl.valid) {
         gl_capture(display, surface);
     }
 
@@ -1086,7 +1150,10 @@ void *eglCreateWindowSurface(void *display, void *config, void *win, const intpt
 
     void *res = egl_f.CreateWindowSurface(display, config, win, attrib_list);
     if (res) {
-        data.winid = (uintptr_t)win;
+        struct gl_surface *s = gl_surface_get_or_create(res);
+        if (s) {
+            s->winid = (uintptr_t)win;
+        }
     }
 
     return res;
@@ -1147,7 +1214,7 @@ void glXDestroyContext(void *display, void *context)
         return;
     }
 
-    gl_free();
+    gl_surface_destroy_all();
 
     glx_f.DestroyContext(display, context);
 }
@@ -1158,7 +1225,7 @@ void glXSwapBuffers(void *display, void *drawable)
         return;
     }
 
-    if (data.valid) {
+    if (gl.valid) {
         gl_capture(display, drawable);
     }
 
@@ -1171,7 +1238,7 @@ int64_t glXSwapBuffersMscOML(void *display, void *drawable, int64_t target_msc, 
         return 0;
     }
 
-    if (data.valid) {
+    if (gl.valid) {
         gl_capture(display, drawable);
     }
 

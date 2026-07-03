@@ -89,6 +89,7 @@ struct capture_control_data {
 #define CAPTURE_CONTROL_DATA_SIZE 32
 static_assert(sizeof(struct capture_control_data) == CAPTURE_CONTROL_DATA_SIZE, "size mismatch");
 
+// Singleton capture API (one capture per process). Used by the Vulkan layer.
 void capture_init();
 void capture_update_socket();
 void capture_init_shtex(
@@ -106,3 +107,27 @@ bool capture_allocate_linear();
 bool capture_allocate_map_host();
 
 bool capture_compare_device_uuid(uint8_t uuid[16]);
+
+// Multi-instance capture API. Each context owns its own socket connection to
+// the OBS server, so a single process can expose several simultaneous captures
+// (e.g. one drawable per monitor). Used by the OpenGL injection layer.
+typedef struct capture_context capture_t;
+
+capture_t *capture_create();
+void capture_destroy(capture_t *ctx);
+void capture_ctx_update_socket(capture_t *ctx);
+void capture_ctx_init_shtex(capture_t *ctx,
+        int width, int height, int format, int strides[4],
+        int offsets[4], uint64_t modifier, uint32_t winid,
+        bool flip, uint32_t color_space, int nfd, int fds[4]);
+void capture_ctx_stop(capture_t *ctx);
+
+bool capture_ctx_should_stop(capture_t *ctx);
+bool capture_ctx_should_init(capture_t *ctx);
+bool capture_ctx_ready(capture_t *ctx);
+
+bool capture_ctx_allocate_no_modifiers(capture_t *ctx);
+bool capture_ctx_allocate_linear(capture_t *ctx);
+bool capture_ctx_allocate_map_host(capture_t *ctx);
+
+bool capture_ctx_compare_device_uuid(capture_t *ctx, uint8_t uuid[16]);

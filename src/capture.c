@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "utils.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <errno.h>
@@ -29,7 +30,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <sys/un.h>
 #include <sys/socket.h>
 
-static struct {
+struct capture_context {
     int connfd;
     bool accepted;
     bool capturing;
@@ -38,7 +39,11 @@ static struct {
     bool map_host;
     bool need_reinit;
     uint8_t device_uuid[16];
-} data;
+    int64_t last_check;
+};
+
+// Singleton context backing the global capture API used by the Vulkan layer.
+static struct capture_context g_ctx;
 
 static bool get_wine_exe(char *buf, size_t bufsize)
 {
@@ -71,7 +76,7 @@ static bool get_exe(char *buf, size_t bufsize)
     return true;
 }
 
-static bool capture_try_connect()
+static bool ctx_try_connect(struct capture_context *d)
 {
     const char sockname[] = "/com/obsproject/vkcapture";
 
@@ -87,7 +92,7 @@ static bool capture_try_connect()
         return false;
     }
 
-    data.connfd = sock;
+    d->connfd = sock;
 
     struct capture_client_data cd;
     cd.type = CAPTURE_CLIENT_DATA_TYPE;
@@ -101,7 +106,7 @@ static bool capture_try_connect()
     msg.msg_iov = &io;
     msg.msg_iovlen = 1;
 
-    const ssize_t sent = sendmsg(data.connfd, &msg, MSG_NOSIGNAL);
+    const ssize_t sent = sendmsg(d->connfd, &msg, MSG_NOSIGNAL);
     if (sent < 0) {
         hlog("Socket sendmsg error %s", strerror(errno));
     }
@@ -109,40 +114,39 @@ static bool capture_try_connect()
     return true;
 }
 
-void capture_init()
+static void ctx_init(struct capture_context *d)
 {
-    memset(&data, 0, sizeof(data));
-    data.connfd = -1;
+    memset(d, 0, sizeof(*d));
+    d->connfd = -1;
 }
 
-void capture_update_socket()
+static void ctx_update_socket(struct capture_context *d)
 {
-    static int64_t last_check = 0;
     const int64_t now = os_time_get_nano();
-    if (now - last_check < 1000000000) {
+    if (now - d->last_check < 1000000000) {
         return;
     }
-    last_check = now;
+    d->last_check = now;
 
-    if (data.connfd < 0 && !capture_try_connect()) {
+    if (d->connfd < 0 && !ctx_try_connect(d)) {
         return;
     }
 
     struct capture_control_data control;
-    ssize_t n = recv(data.connfd, &control, sizeof(control), 0);
+    ssize_t n = recv(d->connfd, &control, sizeof(control), 0);
     if (n == sizeof(control)) {
-        const bool old_no_modifiers = data.no_modifiers;
-        const bool old_linear = data.linear;
-        const bool old_map_host = data.map_host;
-        data.accepted = control.capturing == 1;
-        data.no_modifiers = control.no_modifiers == 1;
-        data.linear = control.linear == 1;
-        data.map_host = control.map_host == 1;
-        memcpy(data.device_uuid, control.device_uuid, 16);
-        if (data.capturing && (old_no_modifiers != data.no_modifiers
-            || old_linear != data.linear
-            || old_map_host != data.map_host)) {
-            data.need_reinit = true;
+        const bool old_no_modifiers = d->no_modifiers;
+        const bool old_linear = d->linear;
+        const bool old_map_host = d->map_host;
+        d->accepted = control.capturing == 1;
+        d->no_modifiers = control.no_modifiers == 1;
+        d->linear = control.linear == 1;
+        d->map_host = control.map_host == 1;
+        memcpy(d->device_uuid, control.device_uuid, 16);
+        if (d->capturing && (old_no_modifiers != d->no_modifiers
+            || old_linear != d->linear
+            || old_map_host != d->map_host)) {
+            d->need_reinit = true;
         }
     }
     if (n == -1) {
@@ -154,13 +158,13 @@ void capture_update_socket()
         }
     }
     if (n <= 0) {
-        close(data.connfd);
-        data.connfd = -1;
-        data.accepted = false;
+        close(d->connfd);
+        d->connfd = -1;
+        d->accepted = false;
     }
 }
 
-void capture_init_shtex(
+static void ctx_init_shtex(struct capture_context *d,
         int width, int height, int format, int strides[4],
         int offsets[4], uint64_t modifier, uint32_t winid,
         bool flip, uint32_t color_space, int nfd, int fds[4])
@@ -196,51 +200,167 @@ void capture_init_shtex(
     cmsg->cmsg_len = CMSG_LEN(sizeof(int) * nfd);
     memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * nfd);
 
-    const ssize_t sent = sendmsg(data.connfd, &msg, MSG_NOSIGNAL);
+    const ssize_t sent = sendmsg(d->connfd, &msg, MSG_NOSIGNAL);
     if (sent < 0) {
         hlog("Socket sendmsg error %s", strerror(errno));
     }
 
-    data.capturing = true;
-    data.need_reinit = false;
+    d->capturing = true;
+    d->need_reinit = false;
+}
+
+static void ctx_stop(struct capture_context *d)
+{
+    d->capturing = false;
+}
+
+static bool ctx_should_stop(struct capture_context *d)
+{
+    return d->capturing && (d->connfd < 0 || !d->accepted || d->need_reinit);
+}
+
+static bool ctx_should_init(struct capture_context *d)
+{
+    return !d->capturing && d->connfd >= 0 && d->accepted;
+}
+
+/* ------------------------------------------------------------------ */
+/* Singleton API (Vulkan layer)                                       */
+/* ------------------------------------------------------------------ */
+
+void capture_init()
+{
+    ctx_init(&g_ctx);
+}
+
+void capture_update_socket()
+{
+    ctx_update_socket(&g_ctx);
+}
+
+void capture_init_shtex(
+        int width, int height, int format, int strides[4],
+        int offsets[4], uint64_t modifier, uint32_t winid,
+        bool flip, uint32_t color_space, int nfd, int fds[4])
+{
+    ctx_init_shtex(&g_ctx, width, height, format, strides, offsets,
+            modifier, winid, flip, color_space, nfd, fds);
 }
 
 void capture_stop()
 {
-    data.capturing = false;
+    ctx_stop(&g_ctx);
 }
 
 bool capture_should_stop()
 {
-    return data.capturing && (data.connfd < 0 || !data.accepted || data.need_reinit);
+    return ctx_should_stop(&g_ctx);
 }
 
 bool capture_should_init()
 {
-    return !data.capturing && data.connfd >= 0 && data.accepted;
+    return ctx_should_init(&g_ctx);
 }
 
 bool capture_ready()
 {
-    return data.capturing;
+    return g_ctx.capturing;
 }
 
 bool capture_allocate_no_modifiers()
 {
-    return data.no_modifiers;
+    return g_ctx.no_modifiers;
 }
 
 bool capture_allocate_linear()
 {
-    return data.linear;
+    return g_ctx.linear;
 }
 
 bool capture_allocate_map_host()
 {
-    return data.map_host;
+    return g_ctx.map_host;
 }
 
 bool capture_compare_device_uuid(uint8_t uuid[16])
 {
-    return memcmp(data.device_uuid, uuid, 16) == 0;
+    return memcmp(g_ctx.device_uuid, uuid, 16) == 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Multi-instance API (OpenGL injection layer)                        */
+/* ------------------------------------------------------------------ */
+
+capture_t *capture_create()
+{
+    capture_t *ctx = malloc(sizeof(*ctx));
+    if (ctx) {
+        ctx_init(ctx);
+    }
+    return ctx;
+}
+
+void capture_destroy(capture_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    if (ctx->connfd >= 0) {
+        close(ctx->connfd);
+    }
+    free(ctx);
+}
+
+void capture_ctx_update_socket(capture_t *ctx)
+{
+    ctx_update_socket(ctx);
+}
+
+void capture_ctx_init_shtex(capture_t *ctx,
+        int width, int height, int format, int strides[4],
+        int offsets[4], uint64_t modifier, uint32_t winid,
+        bool flip, uint32_t color_space, int nfd, int fds[4])
+{
+    ctx_init_shtex(ctx, width, height, format, strides, offsets,
+            modifier, winid, flip, color_space, nfd, fds);
+}
+
+void capture_ctx_stop(capture_t *ctx)
+{
+    ctx_stop(ctx);
+}
+
+bool capture_ctx_should_stop(capture_t *ctx)
+{
+    return ctx_should_stop(ctx);
+}
+
+bool capture_ctx_should_init(capture_t *ctx)
+{
+    return ctx_should_init(ctx);
+}
+
+bool capture_ctx_ready(capture_t *ctx)
+{
+    return ctx->capturing;
+}
+
+bool capture_ctx_allocate_no_modifiers(capture_t *ctx)
+{
+    return ctx->no_modifiers;
+}
+
+bool capture_ctx_allocate_linear(capture_t *ctx)
+{
+    return ctx->linear;
+}
+
+bool capture_ctx_allocate_map_host(capture_t *ctx)
+{
+    return ctx->map_host;
+}
+
+bool capture_ctx_compare_device_uuid(capture_t *ctx, uint8_t uuid[16])
+{
+    return memcmp(ctx->device_uuid, uuid, 16) == 0;
 }
