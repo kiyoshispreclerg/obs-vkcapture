@@ -105,7 +105,6 @@ typedef struct {
     int buf_id;
     int client_id;
     struct capture_texture_data tdata;
-    bool was_showing;
 
 } vkcapture_source_t;
 
@@ -375,7 +374,6 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
     da_init(ctx->windows);
 
     vkcapture_source_update(ctx, settings);
-    ctx->was_showing = true;
 
     cursor_create(ctx);
 
@@ -390,11 +388,16 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
 }
 
 // Returns the 1-based position of `client` among all connected clients that
-// share its executable name (in connection order), and stores the total number
-// of those clients in `count` when non-NULL. Must be called with server.mutex held.
+// share its executable name, ordered by drawable area from largest to smallest
+// (#1 is the biggest), and stores the total number of those clients in `count`
+// when non-NULL. Ordering by size keeps the index stable across sessions when
+// the drawables differ in size, unlike connection order. Ties are broken by
+// winid then array position for a unique, deterministic index. Must be called
+// with server.mutex held.
 static int client_instance_index(const vkcapture_client_t *client, int *count)
 {
-    int idx = 0;
+    const int64_t area = (int64_t)client->tdata.width * client->tdata.height;
+    int idx = 1;
     int total = 0;
     for (size_t i = 0; i < server.clients.num; i++) {
         const vkcapture_client_t *c = server.clients.array + i;
@@ -403,7 +406,13 @@ static int client_instance_index(const vkcapture_client_t *client, int *count)
         }
         ++total;
         if (c == client) {
-            idx = total;
+            continue;
+        }
+        const int64_t carea = (int64_t)c->tdata.width * c->tdata.height;
+        if (carea > area
+                || (carea == area && c->tdata.winid < client->tdata.winid)
+                || (carea == area && c->tdata.winid == client->tdata.winid && c < client)) {
+            ++idx;
         }
     }
     if (count) {
@@ -551,23 +560,22 @@ static void vkcapture_source_video_tick(void *data, float seconds)
 
     const bool is_showing = obs_source_showing(ctx->source);
 
-    if (is_showing != ctx->was_showing && ctx->client_id) {
-        pthread_mutex_lock(&server.mutex);
-        vkcapture_client_t *client = find_client_by_id(ctx->client_id);
-        if (client) {
-            activate_client(ctx, client, is_showing);
-
-            if (!is_showing) {
-                ctx->client_id = 0;
-                destroy_texture(ctx);
-            }
-        }
-        pthread_mutex_unlock(&server.mutex);
-
-        ctx->was_showing = is_showing;
-    }
-
+    // When the source is not visible, release the client we hold (if any) so it
+    // frees its VRAM. This is driven by the current state every tick rather than
+    // by a showing->hidden edge, which keeps the client activation refcount
+    // balanced (exactly one release per acquire) across repeated show/hide
+    // cycles and target changes.
     if (!is_showing) {
+        if (ctx->client_id) {
+            pthread_mutex_lock(&server.mutex);
+            vkcapture_client_t *client = find_client_by_id(ctx->client_id);
+            if (client) {
+                activate_client(ctx, client, false);
+            }
+            ctx->client_id = 0;
+            destroy_texture(ctx);
+            pthread_mutex_unlock(&server.mutex);
+        }
         return;
     }
 

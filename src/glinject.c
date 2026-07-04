@@ -1042,10 +1042,20 @@ static void gl_capture(void *display, void *surface)
     }
     s->display = display;
 
-    capture_ctx_update_socket(s->capture);
-
-    if (capture_ctx_should_stop(s->capture)) {
-        gl_free(s);
+    // Poll every known surface's socket, not just this one, so a capture is
+    // stopped and its VRAM freed promptly even when its own surface is no longer
+    // being swapped (e.g. after the OBS source is hidden). Deleting GL resources
+    // is valid here: we are inside a swap with a current context, shared by all
+    // of the app's surfaces.
+    for (int i = 0; i < MAX_GL_SURFACES; ++i) {
+        struct gl_surface *o = gl_surfaces[i];
+        if (!o) {
+            continue;
+        }
+        capture_ctx_update_socket(o->capture);
+        if (capture_ctx_should_stop(o->capture)) {
+            gl_free(o);
+        }
     }
 
     if (capture_ctx_should_init(s->capture)) {
